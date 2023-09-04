@@ -550,9 +550,6 @@ do_tree() {
 	fi
 
 	mkdir -p "${PORTDIR}"
-	rm -rf "${PORTDIR}"
-	cp -Rp ~/Gentoo2/var/db/repos/gentoo "${PORTDIR}"
-	return 0
 	if [[ ! -e ${PORTDIR}/.unpacked ]]; then
 		# latest tree cannot be fetched from mirrors, always have to
 		# respect the source to get the latest
@@ -583,6 +580,7 @@ bootstrap_tree() {
 
 	[[ -n ${LATEST_TREE_YES} ]] && PV=latest
 
+	## TODO: currently portage tree need manual helps
 	do_tree "${SNAPSHOT_URL}" portage-${PV}.tar.bz2
 
 	local ret=$?
