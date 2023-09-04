@@ -239,10 +239,11 @@ configure_toolchain() {
 					# this is Clang, recent enough to compile recent clang
 					compiler_stage1+="
 						${llvm_deps}
-						sys-libs/libcxxabi
-						sys-libs/libcxx
+						sys-libs/compiler-rt
 						sys-devel/llvm
+						sys-devel/lld
 						sys-devel/clang
+						sys-devel/clang-common
 					"
 					CC=clang
 					CXX=clang++
@@ -250,7 +251,7 @@ configure_toolchain() {
 					# binutils-apple, rely on the host-installed ld to
 					# build a compiler, we'll pull in binutils-apple
 					# from system set
-					linker=sys-devel/native-cctools
+					linker=sys-devel/lld
 					;;
 				*)
 					eerror "unknown/unsupported compiler"
@@ -261,10 +262,15 @@ configure_toolchain() {
 			compiler="
 				dev-libs/libffi
 				${llvm_deps}
+				sys-libs/compiler-rt
 				sys-libs/libcxxabi
 				sys-libs/libcxx
 				sys-devel/llvm
-				sys-devel/clang"
+				sys-devel/lld
+				sys-libs/llvm-libunwind
+				sys-devel/clang
+				sys-devel/clang-common
+			"
 			;;
 		*-freebsd* | *-openbsd*)
 			CC=clang
@@ -470,11 +476,13 @@ bootstrap_profile() {
 		fi
 		( cd "${ROOT}" && ln -s "${SDKPATH}" MacOSX.sdk )
 		einfo "using system sources from ${SDKPATH}"
-	fi
 
-	if [[ ${DARWIN_USE_GCC} == 1 ]] ; then
-		# amend profile, to use gcc one
-		profile="${profile}/gcc"
+		if [[ ${DARWIN_USE_GCC} == 1 ]] ; then
+			# amend profile, to use gcc one
+			profile="${profile}/gcc"
+		elif [[ "${STAGE}" != stage2 ]]; then
+			profile="${profile}/clang"
+		fi
 	fi
 
 	[[ -n ${PROFILE_BASE}${PROFILE_VARIANT} ]] &&
@@ -542,6 +550,9 @@ do_tree() {
 	fi
 
 	mkdir -p "${PORTDIR}"
+	rm -rf "${PORTDIR}"
+	cp -Rp ~/Gentoo2/var/db/repos/gentoo "${PORTDIR}"
+	return 0
 	if [[ ! -e ${PORTDIR}/.unpacked ]]; then
 		# latest tree cannot be fetched from mirrors, always have to
 		# respect the source to get the latest
@@ -655,6 +666,8 @@ bootstrap_portage() {
 	cd "${S}"
 
 	fix_config_sub
+
+	patch -p1 < "${ROOT}/var/db/repos/gentoo/sys-apps/portage/files/portage-3.0.49-prefix-stage2.patch"
 
 	# disable ipc
 	sed -e "s:_enable_ipc_daemon = True:_enable_ipc_daemon = False:" \
@@ -1170,12 +1183,11 @@ bootstrap_cmake_core() {
 
 	# we need sysroot crap to build cmake itself, but it makes trouble
 	# later on, so kill it in the installed version
-	ver=${A%-*} ; ver=${ver%.*}
 	sed -i -e '/cmake_gnu_set_sysroot_flag/d' \
-		"${ROOT}"/tmp/usr/share/${ver}/Modules/Platform/Apple-GNU-*.cmake || die
+		"${ROOT}"/tmp/usr/share/cmake*/Modules/Platform/Apple-GNU-*.cmake || die
 	# disable isysroot usage with clang as well
 	sed -i -e '/_SYSROOT_FLAG/d' \
-		"${ROOT}"/tmp/usr/share/${ver}/Modules/Platform/Apple-Clang.cmake || die
+		"${ROOT}"/tmp/usr/share/cmake*/Modules/Platform/Apple-Clang.cmake || die
 
 	einfo "${A%.tar.*} bootstrapped"
 }
@@ -1409,7 +1421,7 @@ bootstrap_stage1() {
 		[[ -e ${ROOT}/tmp/${x} ]] || ( cd "${ROOT}"/tmp && ln -s usr/${x} )
 	done
 
-	configure_toolchain
+	STAGE=stage1 configure_toolchain || return 1
 	export CC CXX
 
 	# Run all bootstrap_* commands in a subshell since the targets
@@ -1577,7 +1589,7 @@ bootstrap_stage1() {
 	[[ -e ${ROOT}/tmp/etc/portage/make.profile ]] || \
 		(	"${CP}" -dpR "${ROOT}"/etc/portage "${ROOT}"/tmp/etc && \
 			rm -f "${ROOT}"/tmp/etc/portage/make.profile && \
-			(ROOT="${ROOT}"/tmp PREFIX_DISABLE_RAP=yes bootstrap_profile) ) || return 1
+			(ROOT="${ROOT}"/tmp PREFIX_DISABLE_RAP=yes STAGE=stage2 bootstrap_profile) ) || return 1
 
 	# setup portage
 	[[ -e ${ROOT}/tmp/usr/bin/emerge ]] || (bootstrap_portage) || return 1
@@ -1633,7 +1645,6 @@ do_emerge_pkgs() {
 			-fortran
 			-gdbm
 			-git
-			-libcxx
 			-nls
 			-pcre
 			-python
@@ -1644,6 +1655,19 @@ do_emerge_pkgs() {
 			clang
 			internal-glib
 		)
+		if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 0 ]] ; then
+			myuse+=(
+				-binutils-plugin
+				default-compiler-rt
+				default-libcxx
+				default-lld
+			)
+		else
+			myuse+=( -libcxx )
+		fi
+		if [[ ${STAGE} == stage2 ]] ; then
+			myuse+=( bootstrap-prefix )
+		fi
 		local override_make_conf_dir="${PORTAGE_OVERRIDE_EPREFIX}${MAKE_CONF_DIR#${ROOT}}"
 
 		if [[ " ${USE} " == *" prefix-stack "* ]] &&
@@ -1703,10 +1727,40 @@ bootstrap_stage2() {
 
 	# Find out what toolchain packages we need, and configure LDFLAGS
 	# and friends.
-	configure_toolchain || return 1
+	STAGE=stage2 configure_toolchain || return 1
 	configure_cflags || return 1
 	export CONFIG_SHELL="${ROOT}"/tmp/bin/bash
 	export CC CXX
+
+	# provide active SDK link on Darwin
+	if [[ ${CHOST} == *-darwin* ]] ; then
+		rm -f "${ROOT}"/tmp/MacOSX.sdk
+		( cd "${ROOT}"/tmp && ln -s ../MacOSX.sdk . )
+		if [[ ${DARWIN_USE_GCC} == 0 ]] ; then
+			# TODO: libtool is here only because of the hack in the compiler-rt's ebuild
+			for bin in libtool clang clang++ ; do
+				{
+					echo "#!${ROOT}/tmp/bin/sh"
+					echo "${bin}"' "$@"'
+				} > "${ROOT}"/tmp/usr/bin/${CHOST}-${bin}
+				chmod +x "${ROOT}"/tmp/usr/bin/${CHOST}-${bin}
+			done
+		fi
+		if [[ ${DARWIN_USE_GCC} == 123 ]] ; then
+			{
+				echo 'PATH="/Library/Developer/CommandLineTools/usr/bin:$PATH"'
+				echo "CFLAGS=\"-L ${ROOT}/tmp/MacOSX.sdk/usr/lib -isystem ${ROOT}/tmp/MacOSX.sdk/usr/include ${CFLAGS}\""
+				#echo 'CXXFLAGS="${CFLAGS}"'
+				#echo 'LDFLAGS="${LDFLAGS} -mlinker-version=305"'
+				#echo LIBTOOL=libtool
+				# clang-cpp and llvm-ar set by profile don't exist yet
+				#echo 'CPP="clang -E"'
+				#echo 'AR=ar'
+				#echo 'NM=nm'
+				#echo 'RANLIB=ranlib'
+			} > "${ROOT}/tmp/etc/portage/make.conf/0102_bootstrap_prefix_darwin.conf"
+		fi
+	fi
 
 	emerge_pkgs() {
 		EPREFIX="${ROOT}"/tmp \
@@ -1798,21 +1852,19 @@ bootstrap_stage2() {
 	[[ ${CHOST} == *-solaris* ]] && echo "=dev-libs/libffi-3.3_rc0" \
 		>> "${ROOT}"/tmp/etc/portage/package.mask
 
-	# provide active SDK link on Darwin
-	if [[ ${CHOST} == *-darwin* ]] ; then
-		rm -f "${ROOT}"/tmp/MacOSX.sdk
-		( cd "${ROOT}"/tmp && ln -s ../MacOSX.sdk )
-	fi
-
 	# cmake has some external dependencies which require autoconf, etc.
 	# unless we only build the buildtool, bug #603012
 	echo "dev-util/cmake -server" >> "${ROOT}"/tmp/etc/portage/package.use
 
 	emerge_pkgs --nodeps "${pkgs[@]}" || return 1
 
-	# Debian multiarch supported by RAP needs ld to support sysroot.
-	EXTRA_ECONF=$(rapx --with-sysroot=/) \
-	emerge_pkgs --nodeps ${linker} || return 1
+	if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 0 ]] ; then
+		:
+	else
+		# Debian multiarch supported by RAP needs ld to support sysroot.
+		EXTRA_ECONF=$(rapx --with-sysroot=/) \
+		emerge_pkgs --nodeps ${linker} || return 1
+	fi
 
 	# During Gentoo prefix bootstrap stage2, GCC is built with
 	# "--disable-bootstrap". For Darwin, it means that rather than letting
@@ -1829,7 +1881,7 @@ bootstrap_stage2() {
 	# Thus, embedded rpath should be disabled during prefix bootstrap stage2
 	# and passed into EXTRA_ECONF.
 	# https://bugs.gentoo.org/895334
-	if [[ ${CHOST} == *-darwin* ]] ;
+	if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 1 ]] ;
 	then
 		local disable_darwin_rpath="--disable-darwin-at-rpath"
 	else
@@ -1844,10 +1896,10 @@ bootstrap_stage2() {
 		# to find our prefix
 		# For >=gcc-12.2.0, rpath needs to be disabled in stage2 on
 		# Darwin, see above.
+		# OVERRIDE_CXXFLAGS="${CPPFLAGS} -O2 -pipe" \
 		EXTRA_ECONF="--disable-bootstrap $(rapx --with-linker-hash-style=both) --with-local-prefix=${ROOT} ${disable_darwin_rpath}" \
 		MYCMAKEARGS="-DCMAKE_USE_SYSTEM_LIBRARY_LIBUV=OFF" \
 		GCC_MAKE_TARGET=all \
-		OVERRIDE_CXXFLAGS="${CPPFLAGS} -O2 -pipe" \
 		TPREFIX="${ROOT}" \
 		PYTHON_COMPAT_OVERRIDE=python$(python_ver) \
 		emerge_pkgs --nodeps ${pkg} || return 1
@@ -1860,6 +1912,10 @@ bootstrap_stage2() {
 			[[ -x ${ROOT}/tmp/usr/bin/clang++ ]] && CXX=clang++
 		fi
 	done
+	if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 0 ]] ; then
+		rm ${ROOT}/tmp/usr/bin/${CHOST}-{libtool,clang,clang++}
+		ln -s ${ROOT}/tmp/usr/lib/llvm/*/bin/llvm-libtool-darwin ${ROOT}/usr/local/bin/libtool
+	fi
 
 	if [[ ${compiler_type} == clang ]] ; then
 		# We use Clang as our toolchain compiler, so we need to make
@@ -1923,7 +1979,7 @@ bootstrap_stage3() {
 	# they stop mucking up builds.
 	rm -f "${ROOT}"/tmp/usr/local/bin/*
 
-	configure_toolchain || return 1
+	STAGE=stage3 configure_toolchain || return 1
 
 	if [[ ${compiler_type} == clang ]] ; then
 		if ! type -P clang > /dev/null ; then
@@ -1970,7 +2026,8 @@ bootstrap_stage3() {
 		# (CBUILD, BDEPEND) and with the system being built
 		# (CHOST, RDEPEND).  To correctly bootstrap stage3,
 		# PORTAGE_OVERRIDE_EPREFIX as BROOT is needed.
-		PREROOTPATH="${ROOT}"$(echo /{,tmp/}{usr/,}{,lib/llvm/{12,11,10}/}{s,}bin | sed "s, ,:${ROOT},g") \
+		#PREROOTPATH="${ROOT}"$(echo /{,tmp/}{usr/,}{,lib/llvm/{12,11,10}/}{s,}bin | sed "s, ,:${ROOT},g") \
+
 		EPREFIX="${ROOT}" PORTAGE_TMPDIR="${PORTAGE_TMPDIR}" \
 		EMERGE_LOG_DIR="${ROOT}"/var/log \
 		STAGE=stage3 \
@@ -2101,8 +2158,12 @@ bootstrap_stage3() {
 			sys-devel/flex
 			sys-devel/binutils-config
 			sys-libs/zlib
-			${linker}
 		)
+		if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 0 ]] ; then
+			:
+		else
+			pkgs+=(${linker})
+		fi
 
 		pre_emerge_pkgs --nodeps "${pkgs[@]}" || return 1
 	fi
@@ -2125,6 +2186,13 @@ bootstrap_stage3() {
 	# in addition, avoid collisions
 	rm -Rf "${ROOT}"/tmp/usr/lib/python$(python_ver)/site-packages/clang
 
+	if [[ ${CHOST} == *-darwin* && ${DARWIN_USE_GCC} == 0 ]] ; then
+		# TODO: libtool is here only because of the hack in the compiler-rt's ebuild
+		if [[ ! -e ${ROOT}/usr/bin/${CHOST}-libtool ]]; then
+			ln -s ${ROOT}/tmp/usr/lib/llvm/*/bin/llvm-libtool-darwin ${ROOT}/usr/bin/${CHOST}-libtool
+		fi
+	fi
+
 	# Try to get ourself out of the mud, bug #575324
 	EXTRA_ECONF="--disable-compiler-version-checks $(rapx '--disable-lto --disable-bootstrap')" \
 	GCC_MAKE_TARGET=$(rapx all) \
@@ -2136,10 +2204,18 @@ bootstrap_stage3() {
 	# Now we have the compiler right there
 	unset CC CXX CPPFLAGS LDFLAGS
 
+	# Now clang is ready, can use it instead of /usr/bin/gcc
+	# TODO: perhaps symlink the whole etc/portage instead?
+	ln -s -f "${ROOT}/etc/portage/make.profile" "${ROOT}/tmp/etc/portage/make.profile"
+	if [[ ${compiler_type} == clang ]] ; then
+		cp "${ROOT}/etc/portage/make.conf/0100_bootstrap_prefix_clang.conf" \
+			"${ROOT}/tmp/etc/portage/make.conf/"
+	fi
+
 	rm -f "${ROOT}"/etc/ld.so.conf.d/stage2.conf
 
 	# need special care, it depends on texinfo, #717786
-	pre_emerge_pkgs --nodeps sys-apps/gawk || return 1
+	without_stack_emerge_pkgs --nodeps sys-apps/gawk || return 1
 
 	( cd "${ROOT}"/usr/bin && test ! -e python && rm -f python$(python_ver) )
 	# Use $ROOT tools where possible from now on.
@@ -2149,10 +2225,36 @@ bootstrap_stage3() {
 	fi
 
 	# Start using apps from new target
-	export PREROOTPATH="${ROOT}/usr/bin:${ROOT}/bin"
+	cat > "${ROOT}"/tmp/etc/env.d/10stage3 <<-EOF
+		PATH="${ROOT}/usr/bin:${ROOT}/bin:${ROOT}"
+	EOF
+	if [[ ${compiler_type} == clang ]] ; then
+		if [[ ! -e "${ROOT}"/tmp/etc/env.d/11stage3-llvm ]]; then
+			ln -s "${ROOT}"/etc/env.d/60llvm-* "${ROOT}"/tmp/etc/env.d/11stage3-llvm
+		fi
+		# Prevent usage of AppleClang aka gcc for bad packages
+		if [[ ! -e "${ROOT}"/usr/bin/gcc ]]; then
+			echo "#!${ROOT}/bin/bash" > "${ROOT}"/usr/bin/gcc
+			echo "false ${CHOST}-clang \"\$@\"" >> "${ROOT}"/usr/bin/gcc
+		fi
+		if [[ ! -e "${ROOT}"/usr/bin/g++ ]]; then
+			echo "#!${ROOT}/bin/bash" > "${ROOT}"/usr/bin/g++
+			echo "false ${CHOST}-clang++ \"\$@\"" >> "${ROOT}"/usr/bin/g++
+		fi
+		chmod +x "${ROOT}"/usr/bin/{gcc,g++}
+		if [[ ${CHOST} == *-darwin* ]]; then
+			if [[ ! -e "${ROOT}"/usr/bin/ld ]]; then
+				echo "#!${ROOT}/bin/bash" > "${ROOT}"/usr/bin/ld
+				echo "false ld64.lld \"\$@\"" >> "${ROOT}"/usr/bin/ld
+			fi
+			chmod +x "${ROOT}"/usr/bin/ld
+		fi
+	fi
+	"${ROOT}"/tmp/usr/sbin/env-update
 
 	# Get a sane bash, overwriting tmp symlinks
-	pre_emerge_pkgs "" "app-shells/bash" || return 1
+	without_stack_emerge_pkgs "" "app-shells/bash" || return 1
+	ln -s "${ROOT}"/bin/bash "${ROOT}"/usr/bin/bash
 
 	# now we have a shell right there
 	unset CONFIG_SHELL
@@ -2174,7 +2276,7 @@ bootstrap_stage3() {
 	# OSX, confusing the buildsystem
 	ac_cv_c_decl_report=warning \
 	TIME_T_32_BIT_OK=yes \
-	pre_emerge_pkgs "" "${pkgs[@]}" || return 1
+	without_stack_emerge_pkgs "" "${pkgs[@]}" || return 1
 
 	if [[ ! -x "${ROOT}"/sbin/openrc-run ]]; then
 		echo "We need openrc-run at ${ROOT}/sbin to merge rsync." \
@@ -2193,6 +2295,7 @@ bootstrap_stage3() {
 	# Switch to the proper portage.
 	hash -r
 
+	if false; then
 	# Update the portage tree.
 	estatus "stage3: updating Portage tree"
 	treedate=$(date -f "${PORTDIR}"/metadata/timestamp +%s)
@@ -2205,6 +2308,7 @@ bootstrap_stage3() {
 		emerge-webrsync --keep || return 1
 	else
 		emerge --color n --sync || emerge-webrsync || return 1
+	fi
 	fi
 
 	# Avoid installing git or encryption just for fun while completing @system
@@ -3238,7 +3342,7 @@ case ${CHOST} in
 		case ${DARWIN_USE_GCC} in
 			yes|true|1)  DARWIN_USE_GCC=1  ;;
 			no|false|0)  DARWIN_USE_GCC=0  ;;
-			*)           DARWIN_USE_GCC=1  ;;   # default to GCC build
+			*)           DARWIN_USE_GCC=0  ;;   # default to GCC build
 		esac
 		;;
 	*)
